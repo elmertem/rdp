@@ -9,12 +9,11 @@ jobs:
     timeout-minutes: 360
 
     steps:
-
       # -------------------------------
       # 1. Ensure backup repo exists
       # -------------------------------
       - name: Ensure backup repo exists
-        uses: octokit/request-action@v3
+        uses: octokit/request-action@v2.4.0
         with:
           route: POST /user/repos
           name: vm_backup_and_restore
