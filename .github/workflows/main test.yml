@@ -1,0 +1,173 @@
+name: Persistent-RDP-Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  persistent-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # -------------------------------
+      # 1. Ensure backup repo exists
+      # -------------------------------
+      - name: Ensure backup repo exists
+        uses: octokit/request-action@v4
+        with:
+          route: POST /user/repos
+          name: vm_backup_and_restore
+          private: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true # If repo exists, skip error
+
+      # -------------------------------
+      # 2. Restore VM State from Repo
+      # -------------------------------
+      - name: Restore VM State
+        run: |
+          git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.actor }}/vm_backup_and_restore.git C:\VMConfig\ || echo "Repo already exists locally"
+          
+          # Restore important folders
+          robocopy "C:\VMConfig\ProgramData" "C:\ProgramData" /MIR /NFL /NDL /NJH /NJS
+          robocopy "C:\VMConfig\ProgramFiles_x86" "C:\Program Files (x86)" /MIR /NFL /NDL /NJH /NJS
+          robocopy "C:\VMConfig\LocalAppData" "$env:LOCALAPPDATA" /MIR /NFL /NDL /NJH /NJS
+          robocopy "C:\VMConfig\RoamingAppData" "$env:APPDATA" /MIR /NFL /NDL /NJH /NJS
+
+      # -------------------------------
+      # 3. Handle RDP password
+      # -------------------------------
+      - name: Set RDP Password
+        run: |
+          if ($env:RDP_PASSWORD) {
+              $password = $env:RDP_PASSWORD
+              Write-Host "Using password from secrets."
+          } else {
+              # Generate strong random password
+              $charSet = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 4
+              $rawPassword += $charSet.Lower | Get-Random -Count 4
+              $rawPassword += $charSet.Number | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 4
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
+              Write-Host "No password provided; generated a strong password."
+          }
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      # -------------------------------
+      # 4. Create RDP user if missing
+      # -------------------------------
+      - name: Create RDP User
+        run: |
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP")) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+              Write-Host "RDP user created."
+          } else {
+              Write-Host "RDP user already exists."
+          }
+
+      # -------------------------------
+      # 5. Configure RDP & Firewall
+      # -------------------------------
+      - name: Configure RDP & Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      # -------------------------------
+      # 6. Install Tailscale if missing
+      # -------------------------------
+      - name: Install Tailscale
+        run: |
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+              $installerPath = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Remove-Item $installerPath -Force
+              Write-Host "Tailscale installed."
+          }
+
+      # -------------------------------
+      # 7. Start Tailscale & assign exit node
+      # -------------------------------
+      - name: Start Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --advertise-exit-node
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      # -------------------------------
+      # 8. Verify RDP connectivity
+      # -------------------------------
+      - name: Test RDP Connectivity
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection failed."; exit 1 }
+          Write-Host "RDP connectivity verified."
+
+      # -------------------------------
+      # 9. Backup VM state to repo (5-hour mark)
+      # -------------------------------
+      - name: Backup VM State to Repo
+        if: ${{ always() }}
+        run: |
+          cd C:\
+          if (-not (Test-Path C:\VMConfig\.git)) { git init C:\VMConfig; cd C:\VMConfig; git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.actor }}/vm_backup_and_restore.git } else { cd C:\VMConfig }
+          
+          # Mirror important folders into VMConfig
+          robocopy "C:\ProgramData" "C:\VMConfig\ProgramData" /MIR /NFL /NDL /NJH /NJS
+          robocopy "C:\Program Files (x86)" "C:\VMConfig\ProgramFiles_x86" /MIR /NFL /NDL /NJH /NJS
+          robocopy "$env:LOCALAPPDATA" "C:\VMConfig\LocalAppData" /MIR /NFL /NDL /NJH /NJS
+          robocopy "$env:APPDATA" "C:\VMConfig\RoamingAppData" /MIR /NFL /NDL /NJH /NJS
+          
+          git add .
+          git commit -m "Snapshot at $(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')"
+          git push -u origin main --force
+
+      # -------------------------------
+      # 10. Show RDP info
+      # -------------------------------
+      - name: Show RDP Info
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+
+      # -------------------------------
+      # 11. Keep session alive
+      # -------------------------------
+      - name: Keep Session Alive
+        run: |
+          Write-Host "Runner active. Workflow simulates persistent session..."
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Ctrl+C to cancel workflow"
+              Start-Sleep -Seconds 300
+          }
